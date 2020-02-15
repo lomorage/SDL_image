@@ -53,6 +53,7 @@ static struct {
 	void (*jpeg_destroy_decompress) (j_decompress_ptr cinfo);
 	boolean (*jpeg_finish_decompress) (j_decompress_ptr cinfo);
 	int (*jpeg_read_header) (j_decompress_ptr cinfo, boolean require_image);
+    void (*jpeg_save_markers) (j_decompress_ptr cinfo, int marker_code, unsigned int length_limit);
 	JDIMENSION (*jpeg_read_scanlines) (j_decompress_ptr cinfo, JSAMPARRAY scanlines, JDIMENSION max_lines);
 	boolean (*jpeg_resync_to_restart) (j_decompress_ptr cinfo, int desired);
 	boolean (*jpeg_start_decompress) (j_decompress_ptr cinfo);
@@ -102,6 +103,13 @@ int IMG_InitJPG()
 			SDL_UnloadObject(lib.handle);
 			return -1;
 		}
+        lib.jpeg_save_markers =
+            (void (*) (j_decompress_ptr, int, unsigned int))
+            SDL_LoadFunction(lib.handle, "jpeg_save_markers");
+        if ( lib.jpeg_save_markers == NULL ) {
+            SDL_UnloadObject(lib.handle);
+            return -1;
+        }
 		lib.jpeg_read_scanlines = 
 			(JDIMENSION (*) (j_decompress_ptr, JSAMPARRAY, JDIMENSION))
 			SDL_LoadFunction(lib.handle, "jpeg_read_scanlines");
@@ -154,6 +162,7 @@ int IMG_InitJPG()
 		lib.jpeg_destroy_decompress = jpeg_destroy_decompress;
 		lib.jpeg_finish_decompress = jpeg_finish_decompress;
 		lib.jpeg_read_header = jpeg_read_header;
+        lib.jpeg_save_markers = jpeg_save_markers;
 		lib.jpeg_read_scanlines = jpeg_read_scanlines;
 		lib.jpeg_resync_to_restart = jpeg_resync_to_restart;
 		lib.jpeg_start_decompress = jpeg_start_decompress;
@@ -371,6 +380,261 @@ static void output_no_message(j_common_ptr cinfo)
 	/* do nothing */
 }
 
+/*
+ * Look through the meta data in the libjpeg decompress structure to determine
+ * if an EXIF Orientation tag is present. If so return its value (1-8),
+ * otherwise return 0
+ *
+ * This function is based on the function get_orientation in io-jpeg.c, part of
+ * the GdkPixbuf library, licensed under LGPLv2+.
+ *   Copyright (C) 1999 Michael Zucchi, The Free Software Foundation
+*/
+#define EXIF_JPEG_MARKER    0xE1
+#define G_LITTLE_ENDIAN     1234
+#define G_BIG_ENDIAN        4321
+
+typedef unsigned int uint;
+typedef unsigned short ushort;
+
+static inline uint16_t vlc_bswap16(uint16_t x)
+{
+    return (x << 8) | (x >> 8);
+}
+
+static inline uint32_t vlc_bswap32(uint32_t x)
+{
+#if defined (__GNUC__) || defined(__clang__)
+    return __builtin_bswap32 (x);
+#else
+    return ((x & 0x000000FF) << 24)
+         | ((x & 0x0000FF00) <<  8)
+         | ((x & 0x00FF0000) >>  8)
+         | ((x & 0xFF000000) >> 24);
+#endif
+}
+
+uint16_t de_get16( void * ptr, uint endian ) {
+    uint16_t val;
+    memcpy( &val, ptr, sizeof( val ) );
+    if ( endian == G_BIG_ENDIAN ) {
+        #ifndef WORDS_BIGENDIAN
+        val = vlc_bswap16( val );
+        #endif
+    } else {
+        #ifdef WORDS_BIGENDIAN
+        val = vlc_bswap16( val );
+        #endif
+    }
+    return val;
+}
+
+uint32_t de_get32( void * ptr, uint endian ) {
+    uint32_t val;
+    memcpy( &val, ptr, sizeof( val ) );
+    if ( endian == G_BIG_ENDIAN ) {
+        #ifndef WORDS_BIGENDIAN
+        val = vlc_bswap32( val );
+        #endif
+    } else {
+        #ifdef WORDS_BIGENDIAN
+        val = vlc_bswap32( val );
+        #endif
+    }
+    return val;
+}
+
+int jpeg_GetOrientation( j_decompress_ptr cinfo )
+{
+    uint i;                    /* index into working buffer */
+    ushort tag_type;           /* endianed tag type extracted from tiff header */
+    uint ret;                  /* Return value */
+    uint offset;               /* de-endianed offset in various situations */
+    uint tags;                 /* number of tags in current ifd */
+    uint type;                 /* de-endianed type of tag */
+    uint count;                /* de-endianed count of elements in a tag */
+    uint tiff = 0;             /* offset to active tiff header */
+    uint endian = 0;           /* detected endian of data */
+
+    jpeg_saved_marker_ptr exif_marker;      /* Location of the Exif APP1 marker */
+    jpeg_saved_marker_ptr cmarker;          /* Location to check for Exif APP1 marker */
+
+    const char leth[] = { 0x49, 0x49, 0x2a, 0x00 }; /* Little endian TIFF header */
+    const char beth[] = { 0x4d, 0x4d, 0x00, 0x2a }; /* Big endian TIFF header */
+
+    #define EXIF_IDENT_STRING   "Exif\000\000"
+    #define EXIF_ORIENT_TAGID   0x112
+
+    /* check for Exif marker (also called the APP1 marker) */
+    exif_marker = NULL;
+    cmarker = cinfo->marker_list;
+
+    while ( cmarker )
+    {
+        if ( cmarker->data_length >= 32 &&
+             cmarker->marker == EXIF_JPEG_MARKER )
+        {
+            /* The Exif APP1 marker should contain a unique
+               identification string ("Exif\0\0"). Check for it. */
+            if ( !memcmp( cmarker->data, EXIF_IDENT_STRING, 6 ) )
+            {
+                exif_marker = cmarker;
+            }
+        }
+        cmarker = cmarker->next;
+    }
+
+    /* Did we find the Exif APP1 marker? */
+    if ( exif_marker == NULL )
+        return 0;
+
+    /* Check for TIFF header and catch endianess */
+    i = 0;
+
+    /* Just skip data until TIFF header - it should be within 16 bytes from marker start.
+       Normal structure relative to APP1 marker -
+            0x0000: APP1 marker entry = 2 bytes
+            0x0002: APP1 length entry = 2 bytes
+            0x0004: Exif Identifier entry = 6 bytes
+            0x000A: Start of TIFF header (Byte order entry) - 4 bytes
+                    - This is what we look for, to determine endianess.
+            0x000E: 0th IFD offset pointer - 4 bytes
+
+            exif_marker->data points to the first data after the APP1 marker
+            and length entries, which is the exif identification string.
+            The TIFF header should thus normally be found at i=6, below,
+            and the pointer to IFD0 will be at 6+4 = 10.
+    */
+
+    while ( i < 16 )
+    {
+        /* Little endian TIFF header */
+        if ( memcmp( &exif_marker->data[i], leth, 4 ) == 0 )
+        {
+            endian = G_LITTLE_ENDIAN;
+        }
+        /* Big endian TIFF header */
+        else
+        if ( memcmp( &exif_marker->data[i], beth, 4 ) == 0 )
+        {
+            endian = G_BIG_ENDIAN;
+        }
+        /* Keep looking through buffer */
+        else
+        {
+            i++;
+            continue;
+        }
+        /* We have found either big or little endian TIFF header */
+        tiff = i;
+        break;
+    }
+
+    /* So did we find a TIFF header or did we just hit end of buffer? */
+    if ( tiff == 0 )
+        return 0;
+
+    /* Read out the offset pointer to IFD0 */
+    offset = de_get32( &exif_marker->data[i] + 4, endian );
+    i = i + offset;
+
+    /* Check that we still are within the buffer and can read the tag count */
+
+    if ( i > exif_marker->data_length - 2 )
+        return 0;
+
+    /* Find out how many tags we have in IFD0. As per the TIFF spec, the first
+       two bytes of the IFD contain a count of the number of tags. */
+    tags = de_get16( &exif_marker->data[i], endian );
+    i = i + 2;
+
+    /* Check that we still have enough data for all tags to check. The tags
+       are listed in consecutive 12-byte blocks. The tag ID, type, size, and
+       a pointer to the actual value, are packed into these 12 byte entries. */
+    if ( tags * 12U > exif_marker->data_length - i )
+        return 0;
+
+    /* Check through IFD0 for tags of interest */
+    while ( tags-- )
+    {
+        tag_type = de_get16( &exif_marker->data[i], endian );
+        /* Is this the orientation tag? */
+        if ( tag_type == EXIF_ORIENT_TAGID )
+        {
+            type = de_get16( &exif_marker->data[i + 2], endian );
+            count = de_get32( &exif_marker->data[i + 4], endian );
+
+            /* Check that type and count fields are OK. The orientation field
+               will consist of a single (count=1) 2-byte integer (type=3). */
+            if ( type != 3 || count != 1 )
+                return 0;
+
+            /* Return the orientation value. Within the 12-byte block, the
+               pointer to the actual data is at offset 8. */
+            ret = de_get16( &exif_marker->data[i + 8], endian );
+            return ( ret <= 8 ) ? ret : 0;
+        }
+        /* move the pointer to the next 12-byte tag field. */
+        i = i + 12;
+    }
+
+    return 0;     /* No EXIF Orientation tag found */
+}
+
+static void get_final_dimensin(const struct jpeg_decompress_struct *cinfo, JDIMENSION *final_height, JDIMENSION *final_width, int i_otag) {
+    if (i_otag == 8) {
+        // rotate 270
+        *final_width = cinfo->output_height;
+        *final_height = cinfo->output_width;
+    } else if (i_otag == 3) {
+        // rotate 180
+        *final_width = cinfo->output_width;
+        *final_height = cinfo->output_height;
+    } else if (i_otag == 6) {
+        // rotate 90
+        *final_width = cinfo->output_height;
+        *final_height = cinfo->output_width;
+    } else {
+        // keep as it is
+        *final_width = cinfo->output_width;
+        *final_height = cinfo->output_height;
+    }
+}
+
+static void rotate(unsigned char * src,  unsigned char * dst, int num_components, int i_otag, JDIMENSION origin_height, JDIMENSION origin_width)
+{
+    int i, j, k;
+    if (i_otag == 8) {
+        // rotate 270
+        for (i = 0; i < origin_height; ++i) {
+            for (j = 0; j < origin_width; ++j) {
+                for (k = 0; k < num_components; ++k) {
+                    dst[num_components * origin_height * (origin_width - j - 1) + num_components * i + k] = src[num_components * (origin_width * i + j) + k];
+                }
+            }
+        }
+    } else if (i_otag == 3) {
+        // rotate 180
+        for (i = 0; i < origin_height; ++i) {
+            for (j = 0; j < origin_width; ++j) {
+                for (k = 0; k < num_components; ++k) {
+                    dst[num_components * origin_width * (origin_height - i - 1) + num_components * (origin_width - j - 1) + k] = src[num_components * (origin_width * i + j) + k];
+                }
+            }
+        }
+    } else if (i_otag == 6) {
+        // rotate 90
+        for (i = 0; i < origin_height; ++i) {
+            for (j = 0; j < origin_width; ++j) {
+                for (k = 0; k < num_components; ++k) {
+                    dst[num_components * (origin_height * j + origin_height - i - 1) + k] = src[num_components * (origin_width * i + j) + k];
+                }
+            }
+        }
+    } else {
+        // keep as it is
+    }
+}
+
 /* Load a JPEG type image from an SDL datasource */
 SDL_Surface *IMG_LoadJPG_RW(SDL_RWops *src)
 {
@@ -407,17 +671,26 @@ SDL_Surface *IMG_LoadJPG_RW(SDL_RWops *src)
 
 	lib.jpeg_create_decompress(&cinfo);
 	jpeg_SDL_RW_src(&cinfo, src);
+
+    lib.jpeg_save_markers( &cinfo, EXIF_JPEG_MARKER, 0xffff );
 	lib.jpeg_read_header(&cinfo, TRUE);
+
+    JDIMENSION final_width;
+    JDIMENSION final_height;
+    int i_otag; /* Orientation tag has valid range of 1-8. 1 is normal orientation, 0 = unspecified = normal */
+    i_otag = jpeg_GetOrientation( &cinfo );
+    printf("Jpeg orientation: %d\n", i_otag);
 
 	if(cinfo.num_components == 4) {
 		/* Set 32-bit Raw output */
 		cinfo.out_color_space = JCS_CMYK;
 		cinfo.quantize_colors = FALSE;
 		lib.jpeg_calc_output_dimensions(&cinfo);
+        get_final_dimensin(&cinfo, &final_height, &final_width, i_otag);
 
 		/* Allocate an output surface to hold the image */
 		surface = SDL_AllocSurface(SDL_SWSURFACE,
-		        cinfo.output_width, cinfo.output_height, 32,
+		        final_width, final_height, 32,
 #if SDL_BYTEORDER == SDL_LIL_ENDIAN
 		                   0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
 #else
@@ -434,10 +707,11 @@ SDL_Surface *IMG_LoadJPG_RW(SDL_RWops *src)
 		cinfo.do_fancy_upsampling = FALSE;
 #endif
 		lib.jpeg_calc_output_dimensions(&cinfo);
+        get_final_dimensin(&cinfo, &final_height, &final_width, i_otag);
 
 		/* Allocate an output surface to hold the image */
 		surface = SDL_AllocSurface(SDL_SWSURFACE,
-		        cinfo.output_width, cinfo.output_height, 24,
+		        final_width, final_height, 24,
 #if SDL_BYTEORDER == SDL_LIL_ENDIAN
 		                   0x0000FF, 0x00FF00, 0xFF0000,
 #else
@@ -455,13 +729,37 @@ SDL_Surface *IMG_LoadJPG_RW(SDL_RWops *src)
 
 	/* Decompress the image */
 	lib.jpeg_start_decompress(&cinfo);
-	while ( cinfo.output_scanline < cinfo.output_height ) {
-		rowptr[0] = (JSAMPROW)(Uint8 *)surface->pixels +
-		                    cinfo.output_scanline * surface->pitch;
-		lib.jpeg_read_scanlines(&cinfo, rowptr, (JDIMENSION) 1);
-	}
+
+    unsigned char * pixel = (unsigned char*)malloc(cinfo.num_components * final_width * final_height);
+    // raw image before rotating
+    //lib.jpeg_read_scanlines(&cinfo, &pixel, cinfo.output_height);
+    while ( cinfo.output_scanline < cinfo.output_height ) {
+        rowptr[0] = (JSAMPROW)pixel +
+                            cinfo.output_scanline * cinfo.num_components * cinfo.output_width;
+        lib.jpeg_read_scanlines(&cinfo, rowptr, (JDIMENSION) 1);
+    }
+
+    // rotate
+    unsigned char * dst = pixel;
+    if (i_otag == 3 || i_otag == 6 || i_otag == 8) {
+        dst = (unsigned char*)malloc(cinfo.num_components * final_width * final_height);
+        rotate(pixel, dst, cinfo.num_components, i_otag, cinfo.output_height, cinfo.output_width);
+        free(pixel);
+    }
+
+    // copy to surface
+    int line = 0;
+    JSAMPROW srcRow, dstRow;
+    while (line < final_height) {
+        srcRow = (JSAMPROW)dst + line * cinfo.num_components * final_width;
+        dstRow = (JSAMPROW)(Uint8 *)surface->pixels + line * surface->pitch;
+        SDL_memcpy(dstRow, srcRow, cinfo.num_components * final_width);
+        line += 1;
+    }
+
 	lib.jpeg_finish_decompress(&cinfo);
 	lib.jpeg_destroy_decompress(&cinfo);
+    free(dst);
 
 	return(surface);
 }

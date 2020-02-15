@@ -184,7 +184,6 @@ SDL_Surface *IMG_LoadHEIC_RW(SDL_RWops *src)
         goto done;
     }
 
-    //heif_err = heif_context_read_from_file(ctx, "/Users/jeromy/work/playground/test-assets/assets/autumn_1440x960.heic", NULL);
     heif_err = heif_context_read_from_reader(ctx, &heif_reader_sdl, src, NULL);
     if (heif_error_Ok != heif_err.code) {
         error = heif_err.message;
@@ -244,6 +243,14 @@ done:    /* Clean up and return */
         heif_image_release(img);
     }
 
+    if (handle) {
+        heif_image_handle_release(handle);
+    }
+
+    if (ctx) {
+	heif_context_free(ctx);
+    }
+
     if ( error ) {
         SDL_RWseek(src, start, RW_SEEK_SET);
         if ( surface ) {
@@ -275,7 +282,7 @@ int IMG_isHEIC(SDL_RWops *src)
 }
 
 /* Load a JPEG type image from an SDL datasource */
-SDL_Surface *IMG_LoadJPG_RW(SDL_RWops *src)
+SDL_Surface *IMG_LoadHEIC_RW(SDL_RWops *src)
 {
     return(NULL);
 }
